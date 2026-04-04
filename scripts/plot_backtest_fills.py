@@ -30,13 +30,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--product",
-        default="EMERALDS",
-        help="Product symbol to plot.",
+        action="append",
+        dest="products",
+        default=None,
+        help="Product symbol to plot. Repeat to generate multiple products. Defaults to all products with submission fills.",
     )
     parser.add_argument(
         "--output",
         default=None,
-        help="PNG output path. Defaults to visualizations/backtest/<log>_<product>_fills_inventory.png",
+        help="PNG output path. Only valid when plotting a single product. Defaults to visualizations/backtest/<log>_<product>_fills_inventory.png",
     )
     return parser.parse_args()
 
@@ -104,6 +106,22 @@ def build_timeseries(trades: pd.DataFrame, product: str) -> pd.DataFrame:
     return series
 
 
+def resolve_products(trades: pd.DataFrame, requested_products: list[str] | None) -> list[str]:
+    available_products = sorted(
+        trades.loc[trades["is_submission"], "symbol"].dropna().astype(str).unique()
+    )
+    if requested_products is None:
+        return available_products
+
+    normalized_products = [product.upper() for product in requested_products]
+    missing_products = sorted(set(normalized_products) - set(available_products))
+    if missing_products:
+        raise ValueError(
+            f"Requested products not found in submission fills: {', '.join(missing_products)}"
+        )
+    return normalized_products
+
+
 def plot_timeseries(series: pd.DataFrame, product: str, output_path: Path) -> None:
     plt.style.use("tableau-colorblind10")
     fig, (count_ax, inv_ax) = plt.subplots(
@@ -157,19 +175,29 @@ def main() -> None:
     args = parse_args()
     log_file = Path(args.log_file)
     trades = load_trade_history(log_file)
-    series = build_timeseries(trades, args.product)
+    products = resolve_products(trades, args.products)
 
-    if args.output is None:
-        stem = log_file.stem
-        output_path = Path("visualizations/backtest") / (
-            f"{stem}_{args.product.lower()}_fills_inventory.png"
-        )
-    else:
-        output_path = Path(args.output)
+    if args.output is not None and len(products) != 1:
+        raise ValueError("--output can only be used when plotting a single product")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plot_timeseries(series, args.product, output_path)
-    print(f"Wrote plot to {output_path.resolve()}")
+    output_paths: list[Path] = []
+    for product in products:
+        series = build_timeseries(trades, product)
+
+        if args.output is None:
+            stem = log_file.stem
+            output_path = Path("visualizations/backtest") / (
+                f"{stem}_{product.lower()}_fills_inventory.png"
+            )
+        else:
+            output_path = Path(args.output)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        plot_timeseries(series, product, output_path)
+        output_paths.append(output_path.resolve())
+
+    for output_path in output_paths:
+        print(f"Wrote plot to {output_path}")
 
 
 if __name__ == "__main__":
