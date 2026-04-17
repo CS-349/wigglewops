@@ -29,11 +29,21 @@ except ImportError:
 
 # Update these if your round dashboard shows different limits.
 POSITION_LIMITS: Dict[str, int] = {
-    "EMERALDS": 20,
-    "TOMATOES": 20,
+    "EMERALDS": 80,
+    "TOMATOES": 80,
 }
 
 EMERALDS_FAIR_VALUE = 10_000
+EMERALDS_MAX_BID = 9_999   # Never bid above this (must maintain positive edge)
+EMERALDS_MIN_ASK = 10_001  # Never ask below this
+EMERALDS_QUOTE_SIZE = 80
+
+# TOMATOES config
+TOMATO_HISTORY_LEN = 30     # ticks of mid-price history to keep (enough for RSI-14 + MACD)
+TOMATO_RSI_PERIOD = 14
+TOMATO_RSI_OVERBOUGHT = 65
+TOMATO_RSI_OVERSOLD = 35
+TOMATO_QUOTE_SIZE = 80
 
 
 @dataclass
@@ -109,10 +119,34 @@ def quote_prices(
     return bid_quote, ask_quote
 
 
+def compute_rsi(prices: List[float], period: int) -> Optional[float]:
+    """Compute RSI from a list of prices. Needs at least period+1 prices."""
+    if len(prices) < period + 1:
+        return None
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains = [max(0, d) for d in deltas]
+    losses = [max(0, -d) for d in deltas]
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def compute_ema(prices: List[float], span: int) -> float:
+    """Compute EMA of the last value given price history."""
+    alpha = 2 / (span + 1)
+    ema = prices[0]
+    for p in prices[1:]:
+        ema = alpha * p + (1 - alpha) * ema
+    return ema
+
+
 class Trader:
     def run(self, state: TradingState):
-        state_cache = self.load_state(state.traderData)
         result: Dict[str, List[Order]] = {}
+        saved = self.load_state(state.traderData)
 
         for product, order_depth in state.order_depths.items():
             position = state.position.get(product, 0)
@@ -120,22 +154,16 @@ class Trader:
             if product == "EMERALDS":
                 result[product] = self.trade_emeralds(order_depth, position)
             elif product == "TOMATOES":
-                orders, tomato_fair = self.trade_tomatoes(
-                    order_depth,
-                    position,
-                    state_cache.get("tomatoes_fair"),
-                )
-                result[product] = orders
-                state_cache["tomatoes_fair"] = tomato_fair
+                result[product] = self.trade_tomatoes(order_depth, position, saved)
             else:
                 result[product] = []
 
-        trader_data = json.dumps(state_cache, separators=(",", ":"))
+        trader_data = json.dumps(saved)
         conversions = 0
         return result, conversions, trader_data
 
     @staticmethod
-    def load_state(raw_state: str) -> Dict[str, float]:
+    def load_state(raw_state: str) -> dict:
         if not raw_state:
             return {}
         try:
@@ -147,80 +175,65 @@ class Trader:
         return {}
 
     def trade_emeralds(self, order_depth: OrderDepth, position: int) -> List[Order]:
-        book = best_bid_ask(order_depth)
-        if book is None:
-            return []
-
-        best_bid, _, best_ask, _ = book
         builder = OrderBuilder("EMERALDS", position, POSITION_LIMITS["EMERALDS"])
 
-        for ask_price, ask_qty in sorted(order_depth.sell_orders.items()):
-            available = abs(ask_qty)
-            if ask_price < EMERALDS_FAIR_VALUE:
-                builder.add_buy(ask_price, min(available, 8))
-            elif ask_price == EMERALDS_FAIR_VALUE and position < 0:
-                builder.add_buy(ask_price, min(available, 4))
+        bba = best_bid_ask(order_depth)
+        if bba:
+            bot_bid, _, bot_ask, _ = bba
+            bid_price = min(bot_bid + 1, EMERALDS_MAX_BID)
+            ask_price = max(bot_ask - 1, EMERALDS_MIN_ASK)
+        else:
+            bid_price = EMERALDS_MAX_BID
+            ask_price = EMERALDS_MIN_ASK
 
-        for bid_price, bid_qty in sorted(order_depth.buy_orders.items(), reverse=True):
-            available = abs(bid_qty)
-            if bid_price > EMERALDS_FAIR_VALUE:
-                builder.add_sell(bid_price, min(available, 8))
-            elif bid_price == EMERALDS_FAIR_VALUE and position > 0:
-                builder.add_sell(bid_price, min(available, 4))
-
-        reservation_price = EMERALDS_FAIR_VALUE - (0.2 * position)
-        bid_quote, ask_quote = quote_prices(
-            best_bid,
-            best_ask,
-            reservation_price,
-            half_spread=3.0,
-        )
-
-        bid_size, ask_size = inventory_skewed_sizes(position, POSITION_LIMITS["EMERALDS"], 5)
-        builder.add_buy(bid_quote, bid_size)
-        builder.add_sell(ask_quote, ask_size)
+        builder.add_buy(bid_price, EMERALDS_QUOTE_SIZE)
+        builder.add_sell(ask_price, EMERALDS_QUOTE_SIZE)
         return builder.orders
 
-    def trade_tomatoes(
-        self,
-        order_depth: OrderDepth,
-        position: int,
-        previous_fair: Optional[float],
-    ) -> Tuple[List[Order], float]:
-        book = best_bid_ask(order_depth)
-        if book is None:
-            return [], previous_fair if previous_fair is not None else 0.0
-
-        best_bid, bid_qty, best_ask, ask_qty = book
-        current_mid = (best_bid + best_ask) / 2
-        current_micro = microprice(best_bid, bid_qty, best_ask, ask_qty)
-        raw_fair = (0.4 * current_mid) + (0.6 * current_micro)
-        fair = raw_fair if previous_fair is None else (0.25 * raw_fair) + (0.75 * previous_fair)
-
+    def trade_tomatoes(self, order_depth: OrderDepth, position: int, saved: dict) -> List[Order]:
         builder = OrderBuilder("TOMATOES", position, POSITION_LIMITS["TOMATOES"])
-        edge_to_take = 2.0
+        bba = best_bid_ask(order_depth)
+        if not bba:
+            return []
 
-        for ask_price, ask_qty in sorted(order_depth.sell_orders.items()):
-            available = abs(ask_qty)
-            if ask_price <= fair - edge_to_take:
-                builder.add_buy(ask_price, min(available, 6))
+        bot_bid, bot_bid_qty, bot_ask, bot_ask_qty = bba
+        mid = (bot_bid + bot_ask) / 2
 
-        for bid_price, bid_qty in sorted(order_depth.buy_orders.items(), reverse=True):
-            available = abs(bid_qty)
-            if bid_price >= fair + edge_to_take:
-                builder.add_sell(bid_price, min(available, 6))
+        # Update price history
+        history: List[float] = saved.get("tom_hist", [])
+        history.append(mid)
+        if len(history) > TOMATO_HISTORY_LEN:
+            history = history[-TOMATO_HISTORY_LEN:]
+        saved["tom_hist"] = history
 
-        reservation_price = fair - (0.35 * position)
-        observed_spread = best_ask - best_bid
-        half_spread = max(2.0, min(5.0, (observed_spread / 2) - 1.0))
-        bid_quote, ask_quote = quote_prices(
-            best_bid,
-            best_ask,
-            reservation_price,
-            half_spread=half_spread,
-        )
+        rsi = compute_rsi(history, TOMATO_RSI_PERIOD)
 
-        bid_size, ask_size = inventory_skewed_sizes(position, POSITION_LIMITS["TOMATOES"], 4)
-        builder.add_buy(bid_quote, bid_size)
-        builder.add_sell(ask_quote, ask_size)
-        return builder.orders, fair
+        # Not enough data yet — just market make with a wide spread
+        if rsi is None:
+            builder.add_buy(bot_bid + 1, TOMATO_QUOTE_SIZE)
+            builder.add_sell(bot_ask - 1, TOMATO_QUOTE_SIZE)
+            return builder.orders
+
+        # ── Step 1: Take liquidity on strong signals ──
+        # Oversold → buy aggressively (hit the ask)
+        if rsi < TOMATO_RSI_OVERSOLD:
+            builder.add_buy(bot_ask, TOMATO_QUOTE_SIZE)
+        # Overbought → sell aggressively (hit the bid)
+        elif rsi > TOMATO_RSI_OVERBOUGHT:
+            builder.add_sell(bot_bid, TOMATO_QUOTE_SIZE)
+
+        # ── Step 2: Passive quotes with remaining capacity ──
+        # Skew quotes based on RSI: tighter on the signal side, wider on the other
+        if rsi < 50:
+            # Leaning bullish — bid closer, ask wider
+            bid_price = bot_bid + 1
+            ask_price = bot_ask
+        else:
+            # Leaning bearish — ask closer, bid wider
+            bid_price = bot_bid
+            ask_price = bot_ask - 1
+
+        builder.add_buy(bid_price, TOMATO_QUOTE_SIZE)
+        builder.add_sell(ask_price, TOMATO_QUOTE_SIZE)
+
+        return builder.orders

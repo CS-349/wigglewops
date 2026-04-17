@@ -214,15 +214,15 @@ class Trader:
             builder.add_sell(bot_ask - 1, TOMATO_QUOTE_SIZE)
             return builder.orders
 
-        # Always penny both sides, extra tick on signal side
+        # All passive — never cross the spread
         if rsi < TOMATO_RSI_OVERSOLD:
-            # Oversold: extra aggressive bid
-            builder.add_buy(bot_bid + 2, TOMATO_QUOTE_SIZE)
-            builder.add_sell(bot_ask - 1, TOMATO_QUOTE_SIZE)
-        elif rsi > TOMATO_RSI_OVERBOUGHT:
-            # Overbought: extra aggressive ask
+            # Oversold: penny the bid, pull back the ask
             builder.add_buy(bot_bid + 1, TOMATO_QUOTE_SIZE)
-            builder.add_sell(bot_ask - 2, TOMATO_QUOTE_SIZE)
+            builder.add_sell(bot_ask, TOMATO_QUOTE_SIZE)
+        elif rsi > TOMATO_RSI_OVERBOUGHT:
+            # Overbought: penny the ask, pull back the bid
+            builder.add_buy(bot_bid, TOMATO_QUOTE_SIZE)
+            builder.add_sell(bot_ask - 1, TOMATO_QUOTE_SIZE)
         else:
             # Neutral: penny both sides
             builder.add_buy(bot_bid + 1, TOMATO_QUOTE_SIZE)
